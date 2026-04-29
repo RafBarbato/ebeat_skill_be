@@ -2,6 +2,10 @@ import express from 'express';
 import cors from 'cors';
 import { createClient } from '@supabase/supabase-js';
 import crypto from 'crypto';
+import { execFile } from 'child_process';
+import { promisify } from 'util';
+
+const execFileP = promisify(execFile);
 
 const app = express();
 app.use(cors());
@@ -12,9 +16,12 @@ const BACKEND_URL = process.env.BACKEND_URL;
 const CLIENT_ID = process.env.CLIENT_ID;
 const CLIENT_SECRET = process.env.CLIENT_SECRET;
 
+// Client pubblico (anon) per OTP / signin
 const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_ANON_KEY);
+// Client privilegiato (service_role) per le tabelle alexa_auth_codes / alexa_refresh_tokens
+const supabaseAdmin = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_SERVICE_KEY);
 
-const authorizationCodes = new Map();
+const AUTH_CODE_TTL_MS = 10 * 60 * 1000;
 
 const ALEXA_REDIRECT_URIS = [
   'https://pitangui.amazon.com/api/skill/link/MFP4HI9LYTIIU',
@@ -144,10 +151,14 @@ app.post('/verify-otp', async (req, res) => {
   const userId = data.user.id;
   const alexaCode = crypto.randomBytes(32).toString('hex');
 
-  authorizationCodes.set(alexaCode, {
-    userId,
-    createdAt: Date.now()
-  });
+  const { error: insertError } = await supabaseAdmin
+    .from('alexa_auth_codes')
+    .insert({ code: alexaCode, user_id: userId });
+
+  if (insertError) {
+    console.log('ERRORE salvataggio auth code:', insertError);
+    return res.status(500).send('Errore interno, riprova.');
+  }
 
   console.log('OTP verificato, userId:', userId, '— redirect verso Alexa');
   return res.redirect(302,
@@ -171,31 +182,150 @@ app.post('/token', async (req, res) => {
     return res.status(401).json({ error: 'invalid_client' });
   }
 
-  const { grant_type, code } = req.body;
+  const { grant_type, code, refresh_token } = req.body;
 
+  // Refresh: Alexa chiama qui ogni ora per rinnovare l'access_token
+  if (grant_type === 'refresh_token') {
+    if (!refresh_token) {
+      return res.status(400).json({ error: 'invalid_grant' });
+    }
+
+    const { data: row, error: lookupError } = await supabaseAdmin
+      .from('alexa_refresh_tokens')
+      .select('user_id')
+      .eq('token', refresh_token)
+      .maybeSingle();
+
+    if (lookupError || !row) {
+      console.log('ERRORE: refresh_token non trovato:', refresh_token);
+      return res.status(400).json({ error: 'invalid_grant' });
+    }
+
+    const userId = row.user_id;
+    const newRefresh = crypto.randomBytes(32).toString('hex');
+
+    // Rotazione: cancella il vecchio, inserisci il nuovo
+    await supabaseAdmin.from('alexa_refresh_tokens').delete().eq('token', refresh_token);
+    await supabaseAdmin.from('alexa_refresh_tokens').insert({
+      token: newRefresh,
+      user_id: userId,
+      last_used_at: new Date().toISOString(),
+    });
+
+    console.log('Token rinnovato per userId:', userId);
+    return res.json({
+      access_token: userId,
+      token_type: 'Bearer',
+      expires_in: 3600,
+      refresh_token: newRefresh
+    });
+  }
+
+  // Primo scambio: code -> access_token + refresh_token
   if (grant_type !== 'authorization_code') {
     console.log('ERRORE: grant_type non valido:', grant_type);
     return res.status(400).json({ error: 'unsupported_grant_type' });
   }
-  if (!code || !authorizationCodes.has(code)) {
+  if (!code) {
+    return res.status(400).json({ error: 'invalid_grant' });
+  }
+
+  const { data: entry, error: codeError } = await supabaseAdmin
+    .from('alexa_auth_codes')
+    .select('user_id, created_at')
+    .eq('code', code)
+    .maybeSingle();
+
+  if (codeError || !entry) {
     console.log('ERRORE: codice non trovato:', code);
     return res.status(400).json({ error: 'invalid_grant' });
   }
 
-  const entry = authorizationCodes.get(code);
-  if (Date.now() - entry.createdAt > 10 * 60 * 1000) {
-    authorizationCodes.delete(code);
+  // Codice consumato comunque (anche se scaduto)
+  await supabaseAdmin.from('alexa_auth_codes').delete().eq('code', code);
+
+  const ageMs = Date.now() - new Date(entry.created_at).getTime();
+  if (ageMs > AUTH_CODE_TTL_MS) {
     return res.status(400).json({ error: 'invalid_grant' });
   }
 
-  authorizationCodes.delete(code);
-  console.log('Token emesso per userId:', entry.userId);
+  const newRefresh = crypto.randomBytes(32).toString('hex');
+  await supabaseAdmin.from('alexa_refresh_tokens').insert({
+    token: newRefresh,
+    user_id: entry.user_id,
+  });
+
+  console.log('Token emesso per userId:', entry.user_id);
 
   res.json({
-    access_token: entry.userId,
+    access_token: entry.user_id,
     token_type: 'Bearer',
-    expires_in: 3600
+    expires_in: 3600,
+    refresh_token: newRefresh
   });
+});
+
+// 5. Refresh URL YouTube scaduto: invocato dalla skill quando rileva url_expires_at < now
+app.post('/refresh-track', async (req, res) => {
+  console.log('--- /refresh-track ---', req.body);
+
+  const authHeader = req.headers['authorization'] || '';
+  const token = authHeader.replace(/^Bearer\s+/i, '').trim();
+  if (token !== process.env.SUPABASE_SERVICE_KEY) {
+    return res.status(401).json({ error: 'unauthorized' });
+  }
+
+  const { user_id, youtube_id } = req.body;
+  if (!user_id || !youtube_id) {
+    return res.status(400).json({ error: 'missing_params' });
+  }
+
+  let info;
+  try {
+    const { stdout } = await execFileP('yt-dlp', [
+      '-j',
+      '-f', 'bestaudio[ext=m4a]/bestaudio/best',
+      '--no-playlist',
+      `https://www.youtube.com/watch?v=${youtube_id}`,
+    ], { maxBuffer: 8 * 1024 * 1024 });
+    info = JSON.parse(stdout);
+  } catch (e) {
+    console.log('ERRORE yt-dlp:', e.message);
+    return res.status(502).json({ error: 'ytdlp_failed', detail: e.message });
+  }
+
+  const url = info.url;
+  if (!url) {
+    return res.status(502).json({ error: 'no_stream_url' });
+  }
+
+  const expiryMatch = /[?&]expire=(\d+)/.exec(url);
+  const expiresAt = expiryMatch
+    ? new Date(parseInt(expiryMatch[1]) * 1000).toISOString()
+    : new Date(Date.now() + 6 * 60 * 60 * 1000).toISOString();
+
+  const { data: updated, error: updateError } = await supabaseAdmin
+    .from('current_track')
+    .update({
+      url,
+      url_expires_at: expiresAt,
+      track_title:  info.title || null,
+      track_artist: info.uploader || info.artist || null,
+      updated_at: new Date().toISOString(),
+    })
+    .eq('user_id', user_id)
+    .select();
+
+  if (updateError) {
+    console.log('ERRORE update current_track:', updateError);
+    return res.status(500).json({ error: 'update_failed', detail: updateError.message });
+  }
+  if (!updated || updated.length === 0) {
+    return res.status(404).json({ error: 'track_not_found' });
+  }
+
+  console.log(`Refresh OK per ${user_id} (${youtube_id})`);
+  res.json({ ok: true, url, url_expires_at: expiresAt });
 });
 
 const PORT = process.env.PORT || 3000;
