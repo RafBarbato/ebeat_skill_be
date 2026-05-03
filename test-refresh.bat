@@ -34,7 +34,7 @@ if "%SUPABASE_SERVICE_KEY%"=="" (
 )
 
 set "YOUTUBE_ID=%~1"
-if "%YOUTUBE_ID%"=="" set "YOUTUBE_ID=VkTNnCCKnE4"
+if "%YOUTUBE_ID%"=="" set "YOUTUBE_ID=C_sMubIJyLU"
 
 set "USER_ID=%~2"
 if "%USER_ID%"=="" set "USER_ID=rafthefurtiv@gmail.com"
