@@ -19,6 +19,7 @@ set "ENV_FILE=%BACKEND_DIR%.env"
 
 if not exist "%ENV_FILE%" (
   echo [ERRORE] .env non trovato in "%ENV_FILE%"
+  pause
   exit /b 1
 )
 
@@ -33,10 +34,12 @@ for /f "usebackq tokens=1,* delims==" %%a in ("%ENV_FILE%") do (
 
 if "%SUPABASE_SERVICE_KEY%"=="" (
   echo [ERRORE] SUPABASE_SERVICE_KEY non presente in .env
+  pause
   exit /b 1
 )
 if "%SUPABASE_URL%"=="" (
   echo [ERRORE] SUPABASE_URL non presente in .env
+  pause
   exit /b 1
 )
 
@@ -48,6 +51,7 @@ if "%~1"=="" (
   echo   USER_ID=^<email^>     cambia utente target ^(default rafthefurtiv@gmail.com^)
   echo   KEEP=1               non cancellare la coda esistente prima dell'insert
   echo   BASE_POSITION=^<n^>   con KEEP=1, position iniziale ^(default 1^)
+  pause
   exit /b 1
 )
 
@@ -80,5 +84,7 @@ echo.
 echo --- Coda risultante per %USER_ID% ---
 curl -sS -X GET "%REST_URL%?user_id=eq.%USER_ID%&order=position.asc&select=position,youtube_id,track_title,track_artist,track_duration" -H "%AUTH%" -H "%APIK%"
 echo.
+echo.
+pause
 
 endlocal
