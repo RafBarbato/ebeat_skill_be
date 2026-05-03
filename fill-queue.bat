@@ -45,14 +45,16 @@ if "%SUPABASE_URL%"=="" (
 
 if "%USER_ID%"=="" set "USER_ID=rafthefurtiv@gmail.com"
 
+rem Tracce di default se l'utente lancia il bat senza argomenti (es. doppio
+rem click). Cosi il dev non deve ricordarsi gli ID a mano.
+set "DEFAULT_IDS=VkTNnCCKnE4 dQw4w9WgXcQ C_sMubIJyLU"
+
 if "%~1"=="" (
-  echo Uso: fill-queue.bat ^<youtube_id_1^> ^<youtube_id_2^> ...
-  echo Variabili d'ambiente opzionali:
-  echo   USER_ID=^<email^>     cambia utente target ^(default rafthefurtiv@gmail.com^)
-  echo   KEEP=1               non cancellare la coda esistente prima dell'insert
-  echo   BASE_POSITION=^<n^>   con KEEP=1, position iniziale ^(default 1^)
-  pause
-  exit /b 1
+  echo Nessun argomento, uso 3 tracce di default: %DEFAULT_IDS%
+  echo Env var opzionali: USER_ID=email, KEEP=1, BASE_POSITION=n
+  echo.
+  call "%~f0" %DEFAULT_IDS%
+  exit /b %ERRORLEVEL%
 )
 
 set "REST_URL=%SUPABASE_URL%/rest/v1/playback_queue"
