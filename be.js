@@ -720,10 +720,15 @@ app.post('/refresh-track-storage', async (req, res) => {
 });
 
 // 5. Refresh URL YouTube scaduto (default): invocato dalla skill quando
-//    rileva url_expires_at < now. Usa yt-dlp con client android_vr e salva
-//    l'URL googlevideo direttamente in current_track.url. Empiricamente
-//    verificato che Alexa riproduce questi URL nonostante l'`ip=` nei
-//    sparams. Più semplice e leggero della variante /refresh-track-storage.
+//    rileva url_expires_at < now. Risolve l'URL googlevideo via
+//    youtubei.js + PO Token (stesso stack di /resolve-youtube-id e
+//    /refill-queue), salvando l'URL "live" direttamente in
+//    current_track.url. Nessun download, nessuna copia del file audio:
+//    rispetta il vincolo di progetto "no storage di bytes audio".
+//
+//    Sostituisce la vecchia pipeline basata su yt-dlp (rate-limited da
+//    YouTube con 429 + bot detection). youtubei.js + bgutils-js PoT è
+//    più resistente al rate limiting.
 app.post('/refresh-track', async (req, res) => {
   console.log('--- /refresh-track ---', req.body);
 
@@ -738,69 +743,53 @@ app.post('/refresh-track', async (req, res) => {
     return res.status(400).json({ error: 'missing_params' });
   }
 
-  const FORMAT = '140/139/bestaudio[ext=m4a]/bestaudio[acodec^=mp4a]/bestaudio[protocol^=m3u8]';
-  const ATTEMPTS = [
-    { client: 'android_vr', format: FORMAT },
-    { client: 'web_safari', format: FORMAT },
-    { client: 'web',        format: FORMAT },
-  ];
-
-  const isAlexaCompatible = (info) => {
-    const ext = String(info?.ext || '').toLowerCase();
-    const acodec = String(info?.acodec || '').toLowerCase();
-    const protocol = String(info?.protocol || '').toLowerCase();
-    return (
-      ext === 'm4a' || ext === 'mp4' ||
-      acodec.startsWith('mp4a') || acodec.startsWith('aac') ||
-      protocol.startsWith('m3u8')
-    );
-  };
-
-  let info = null;
+  // Cascata client youtubei.js: ANDROID_VR e TV_EMBEDDED espongono
+  // ancora formati m4a/AAC senza richiedere PoT stretto. Gli altri
+  // sono fallback se i primi non producono URL utilizzabile.
+  let resolved = null;
   let lastErr = null;
-  for (const { client, format } of ATTEMPTS) {
+  for (const client of YT_CLIENT_STRATEGIES_FUNCTIONAL) {
     try {
-      const { stdout } = await execFileP('yt-dlp', [
-        '-j',
-        '-f', format,
-        '--no-playlist',
-        '--extractor-args', `youtube:player_client=${client}`,
-        `https://www.youtube.com/watch?v=${youtube_id}`,
-      ], { maxBuffer: 8 * 1024 * 1024 });
-      const candidate = JSON.parse(stdout);
-      if (candidate?.url && isAlexaCompatible(candidate)) {
-        console.log(`yt-dlp OK [client=${client}, ext=${candidate.ext}, acodec=${candidate.acodec}, duration=${candidate.duration}]`);
-        info = candidate;
+      const r = await resolveStreamForClient(youtube_id, client);
+      if (r.ok) {
+        console.log(`youtubei.js OK [client=${client}, mime=${r.mime_type}, bitrate=${r.bitrate}]`);
+        resolved = r;
         break;
       }
-      console.log(`yt-dlp client=${client} formato non compatibile [ext=${candidate?.ext}, acodec=${candidate?.acodec}]`);
+      console.log(`youtubei.js [${client}] non ok: ${r.reason}`);
     } catch (e) {
       lastErr = e;
-      console.log(`yt-dlp client=${client} fallito: ${e.message}`);
+      console.log(`youtubei.js [${client}] errore: ${e.message}`);
     }
   }
 
-  if (!info?.url) {
+  if (!resolved?.url) {
     return res.status(502).json({
       error: 'no_compatible_stream',
-      detail: lastErr?.message || 'nessun client yt-dlp ha prodotto un formato Alexa-compatibile',
+      detail: lastErr?.message || 'nessun client youtubei.js ha prodotto uno stream Alexa-compatibile',
     });
   }
 
-  const url = info.url;
-  const expiryMatch = /[?&]expire=(\d+)/.exec(url);
-  const expiresAt = expiryMatch
-    ? new Date(parseInt(expiryMatch[1]) * 1000).toISOString()
-    : new Date(Date.now() + 6 * 60 * 60 * 1000).toISOString();
+  const url = resolved.url;
+  // Preferenza: expires da streaming_data (ISO). Fallback su parsing
+  // del query param `expire=` dell'URL googlevideo. Fallback finale:
+  // 6 ore da adesso.
+  let expiresAt = resolved.expires;
+  if (!expiresAt) {
+    const expiryMatch = /[?&]expire=(\d+)/.exec(url);
+    expiresAt = expiryMatch
+      ? new Date(parseInt(expiryMatch[1]) * 1000).toISOString()
+      : new Date(Date.now() + 6 * 60 * 60 * 1000).toISOString();
+  }
 
   const updates = {
     url,
     url_expires_at: expiresAt,
-    track_title:  info.title || null,
-    track_artist: info.uploader || info.artist || null,
+    track_title:  resolved.title || null,
+    track_artist: resolved.author || null,
     updated_at: new Date().toISOString(),
   };
-  if (info.duration) updates.track_duration = info.duration;
+  if (resolved.duration) updates.track_duration = resolved.duration;
 
   const { data: updated, error: updateError } = await supabaseAdmin
     .from('current_track')
@@ -817,7 +806,211 @@ app.post('/refresh-track', async (req, res) => {
   }
 
   console.log(`Refresh OK per ${user_id} (${youtube_id}) → ${url.slice(0, 80)}...`);
-  res.json({ ok: true, url, url_expires_at: expiresAt, track_duration: info.duration });
+  res.json({ ok: true, url, url_expires_at: expiresAt, track_duration: resolved.duration });
+});
+
+// 6. Resolve title/artist → youtube_id via youtubei.js music search.
+//    Caso 15 (ricerca vocale, turn 2): la skill ha già un candidato Deezer
+//    (title/artist/duration canonici), qui troviamo il video_id YouTube
+//    migliore con scoring per durata + bonus se l'artista compare nei
+//    "artists" del risultato. Search anonima, non richiede PO Token.
+app.post('/resolve-youtube-id', async (req, res) => {
+  console.log('--- /resolve-youtube-id ---', req.body);
+
+  const authHeader = req.headers['authorization'] || '';
+  const token = authHeader.replace(/^Bearer\s+/i, '').trim();
+  if (token !== process.env.SUPABASE_SERVICE_KEY) {
+    return res.status(401).json({ error: 'unauthorized' });
+  }
+
+  const { title, artist, duration } = req.body;
+  if (!title) {
+    return res.status(400).json({ error: 'missing_title' });
+  }
+
+  try {
+    const yt = await Innertube.create({ retrieve_player: false });
+    const query = artist ? `${title} ${artist}` : title;
+    const r = await yt.music.search(query, { type: 'song' });
+
+    const songs = r.songs?.contents ?? r.contents ?? [];
+    if (!songs.length) {
+      return res.json({ youtube_id: null, candidates: [] });
+    }
+
+    const targetDuration = typeof duration === 'number' ? duration : null;
+    const artistLower = artist ? String(artist).toLowerCase() : null;
+
+    const scored = songs.slice(0, 10).map((it) => {
+      const yt_duration = it.duration?.seconds ?? null;
+      const yt_artists = (it.artists ?? []).map((a) => a.name).filter(Boolean);
+      const durationDiff = targetDuration != null && yt_duration != null
+        ? Math.abs(yt_duration - targetDuration)
+        : 999;
+      const artistMatch = artistLower &&
+        yt_artists.some((n) => n.toLowerCase().includes(artistLower));
+      // Score più basso = candidato migliore. Bonus -100 se artista match.
+      const score = durationDiff - (artistMatch ? 100 : 0);
+      return {
+        youtube_id: it.id,
+        yt_title: it.title,
+        yt_artist: yt_artists.join(', ') || (it.author?.name ?? null),
+        yt_duration,
+        score,
+      };
+    });
+    scored.sort((a, b) => a.score - b.score);
+    const best = scored[0];
+
+    console.log(`resolve OK: "${title}" / "${artist}" → ${best.youtube_id} ` +
+      `(yt_title="${best.yt_title}", score=${best.score})`);
+
+    res.json({
+      youtube_id: best.youtube_id,
+      candidates: scored.slice(0, 3),
+    });
+  } catch (e) {
+    console.log('ERRORE /resolve-youtube-id:', e.message);
+    res.status(502).json({ error: 'youtube_search_failed', detail: e.message });
+  }
+});
+
+// 7. Refill playback_queue con tracce correlate al seed (Deezer Radio
+//    + youtubei.js resolve in parallelo + INSERT batch). Caso 15
+//    auto-refill: chiamato dalla skill quando la coda scende sotto
+//    soglia, mantenendo la radio "infinita" attorno al seed pinned.
+app.post('/refill-queue', async (req, res) => {
+  console.log('--- /refill-queue ---', req.body);
+
+  const authHeader = req.headers['authorization'] || '';
+  const token = authHeader.replace(/^Bearer\s+/i, '').trim();
+  if (token !== process.env.SUPABASE_SERVICE_KEY) {
+    return res.status(401).json({ error: 'unauthorized' });
+  }
+
+  const { user_id, seed_deezer_id } = req.body;
+  if (!user_id || !seed_deezer_id) {
+    return res.status(400).json({ error: 'missing_params' });
+  }
+
+  try {
+    // 1. Cascata radio: track_radio → artist_radio → artist_top.
+    //    Per artisti di nicchia /track/{id}/radio è spesso vuoto;
+    //    /artist/{id}/top garantisce risultati se l'artista ha catalogo.
+    const radioRes = await fetch(`https://api.deezer.com/track/${seed_deezer_id}/radio?limit=4`);
+    if (!radioRes.ok) {
+      throw new Error(`Deezer radio HTTP ${radioRes.status}`);
+    }
+    const radioJson = await radioRes.json();
+    let tracks = radioJson.data || [];
+    let source = 'track_radio';
+
+    if (!tracks.length) {
+      console.log(`track_radio vuoto, fallback artist_radio per seed=${seed_deezer_id}`);
+      const seedTrackRes = await fetch(`https://api.deezer.com/track/${seed_deezer_id}`);
+      const seedTrack = seedTrackRes.ok ? await seedTrackRes.json() : null;
+      const artistId = seedTrack?.artist?.id;
+
+      if (artistId) {
+        const artistRadioRes = await fetch(`https://api.deezer.com/artist/${artistId}/radio?limit=4`);
+        if (artistRadioRes.ok) {
+          const arJson = await artistRadioRes.json();
+          tracks = arJson.data || [];
+          if (tracks.length) source = 'artist_radio';
+        }
+
+        if (!tracks.length) {
+          console.log(`artist_radio vuoto, fallback artist_top per artistId=${artistId}`);
+          const topRes = await fetch(`https://api.deezer.com/artist/${artistId}/top?limit=5`);
+          if (topRes.ok) {
+            const topJson = await topRes.json();
+            tracks = (topJson.data || [])
+              .filter((t) => t.id !== Number(seed_deezer_id))
+              .slice(0, 4);
+            if (tracks.length) source = 'artist_top';
+          }
+        }
+      }
+    }
+
+    if (!tracks.length) {
+      console.log(`Tutti i fallback radio vuoti per seed=${seed_deezer_id}`);
+      return res.json({ ok: true, added: 0, source: 'none' });
+    }
+    console.log(`Refill source=${source}, candidate_tracks=${tracks.length}`);
+
+    // 2. Resolve youtube_id per ogni traccia in parallelo.
+    const yt = await Innertube.create({ retrieve_player: false });
+    const resolveOne = async (t) => {
+      const query = t.artist?.name ? `${t.title} ${t.artist.name}` : t.title;
+      try {
+        const r = await yt.music.search(query, { type: 'song' });
+        const songs = r.songs?.contents ?? r.contents ?? [];
+        if (!songs.length) return null;
+
+        const targetDur = typeof t.duration === 'number' ? t.duration : null;
+        const artistLower = t.artist?.name?.toLowerCase() || null;
+        const scored = songs.slice(0, 10).map((it) => {
+          const yt_duration = it.duration?.seconds ?? null;
+          const yt_artists = (it.artists ?? []).map((a) => a.name).filter(Boolean);
+          const durationDiff = (targetDur != null && yt_duration != null)
+            ? Math.abs(yt_duration - targetDur) : 999;
+          const artistMatch = artistLower &&
+            yt_artists.some((n) => n.toLowerCase().includes(artistLower));
+          return { youtube_id: it.id, score: durationDiff - (artistMatch ? 100 : 0) };
+        });
+        scored.sort((a, b) => a.score - b.score);
+        return scored[0]?.youtube_id || null;
+      } catch (e) {
+        console.log(`resolve fallito per "${query}": ${e.message}`);
+        return null;
+      }
+    };
+
+    const resolved = await Promise.all(
+      tracks.map((t) => resolveOne(t).then((yt_id) => ({ t, yt_id })))
+    );
+    const validRows = resolved.filter((r) => r.yt_id);
+    if (!validRows.length) {
+      console.log('Nessuna traccia risolvibile su YouTube');
+      return res.json({ ok: true, added: 0 });
+    }
+
+    // 3. Trova max(position) corrente per user_id.
+    const { data: existing, error: maxErr } = await supabaseAdmin
+      .from('playback_queue')
+      .select('position')
+      .eq('user_id', user_id)
+      .order('position', { ascending: false })
+      .limit(1);
+    if (maxErr) {
+      throw new Error(`max position fetch: ${maxErr.message}`);
+    }
+    let nextPos = (existing && existing[0]?.position) ? existing[0].position + 1 : 1;
+
+    // 4. INSERT batch su playback_queue.
+    const rows = validRows.map(({ t, yt_id }) => ({
+      user_id,
+      position: nextPos++,
+      youtube_id: yt_id,
+      url: null,
+      url_expires_at: null,
+      track_id: t.id,
+      track_title: t.title,
+      track_artist: t.artist?.name || null,
+      track_duration: t.duration || null,
+    }));
+    const { error: insErr } = await supabaseAdmin.from('playback_queue').insert(rows);
+    if (insErr) {
+      throw new Error(`insert playback_queue: ${insErr.message}`);
+    }
+
+    console.log(`Refill OK per ${user_id}: added=${rows.length} (seed=${seed_deezer_id}, source=${source})`);
+    res.json({ ok: true, added: rows.length, source });
+  } catch (e) {
+    console.log('ERRORE /refill-queue:', e.message);
+    res.status(502).json({ error: 'refill_failed', detail: e.message });
+  }
 });
 
 const PORT = process.env.PORT || 3000;
